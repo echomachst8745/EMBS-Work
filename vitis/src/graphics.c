@@ -2,6 +2,7 @@
 
 #include "graphics.h"
 #include "config.h"
+#include "graphic_fonts.h"
 
 #include "xil_cache.h"
 #include "xil_printf.h"
@@ -34,19 +35,12 @@ static int graphicsReady = 0; // Flag to show graphics initialised successfully
 #define COLOUR_UNSOLVED    RGB(0xB0,0xB0,0xB0)
 #define COLOUR_TEXT        RGB(0x00,0x00,0x00)
 
-// Font for clue number characters
-const uint8_t numberFontChars[10][16] = {
-    {0,0,0x7C,0xC6,0xCE,0xDE,0xF6,0xE6,0xC6,0xC6,0x7C,0,0,0,0,0}, // '0'
-    {0,0,0x18,0x38,0x78,0x18,0x18,0x18,0x18,0x18,0x7E,0,0,0,0,0}, // '1'
-    {0,0,0x7C,0xC6,0x06,0x0C,0x18,0x30,0x60,0xC0,0xFE,0,0,0,0,0}, // '2'
-    {0,0,0x7C,0xC6,0x06,0x06,0x3C,0x06,0x06,0xC6,0x7C,0,0,0,0,0}, // '3'
-    {0,0,0x0C,0x1C,0x3C,0x6C,0xCC,0xFE,0x0C,0x0C,0x1E,0,0,0,0,0}, // '4'
-    {0,0,0xFE,0xC0,0xC0,0xC0,0xFC,0x06,0x06,0xC6,0x7C,0,0,0,0,0}, // '5'
-    {0,0,0x38,0x60,0xC0,0xC0,0xFC,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0}, // '6'
-    {0,0,0xFE,0xC6,0x06,0x0C,0x18,0x30,0x30,0x30,0x30,0,0,0,0,0}, // '7'
-    {0,0,0x7C,0xC6,0xC6,0xC6,0x7C,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0}, // '8'
-    {0,0,0x7C,0xC6,0xC6,0xC6,0x7E,0x06,0x06,0x0C,0x78,0,0,0,0,0}  // '9'
-};
+#define CLUE_FONT_DIGIT_ADVANCE_PIXELS   9
+#define CLUE_FONT_DIGIT_HEIGHT_PIXELS    11
+#define CLUE_FONT_DIGIT_BASELINE_PIXELS  10
+#define CLUE_GRID_GAP_PIXELS             4
+#define CLUE_BLOCK_GAP_PIXELS            4
+#define CLUE_LINE_HEIGHT_PIXELS          18
 
 // Struct for puzzle layout
 typedef struct {
@@ -88,34 +82,50 @@ static void FillRectangle(u32 *buf, int x, int y, int w, int h, u32 colour)
     }
 }
 
-static void DrawChar(u32 *buf, int x, int y, char ch, u32 charColour)
+static void DrawChar(u32 *buf, int x, int y, char ch, u32 charColour, const GFXfont *pGfxFont,
+                     uint8_t *outCharWidth, uint8_t *outCharHeight)
 {
-    if (ch < 48 || ch > 57) { return; }
+    const GFXglyph *glyph = &pGfxFont->glyph[ch - pGfxFont->first];
+    const uint8_t *bitmap = &pGfxFont->bitmap[glyph->bitmapOffset];
 
-    const uint8_t *pNumberFontChar = numberFontChars[ch - 48];
+    const uint8_t glyphHeight = glyph->height;
+    const uint8_t glyphWidth = glyph->width;
 
-    for (int row = 0; row < 16; ++row)
+    uint16_t bitIndex = 0;
+
+    for (int row = 0; row < glyphHeight; ++row)
     {
-        uint8_t bits = pNumberFontChar[row];
-
-        for (int col = 0; col < 8; ++col)
+        for (int col = 0; col < glyphWidth; ++col)
         {
-            if (bits & (0x80 >> col))
+            uint8_t byte = bitmap[bitIndex / 8];
+            uint8_t mask = 0x80 >> (bitIndex % 8);
+
+            if (byte & mask)
             {
-                SetPixel(buf, x + col, y + row, charColour);
+                SetPixel(buf,
+                            x + glyph->xOffset + col,
+                            y + glyph->yOffset + row,
+                            charColour);
             }
+
+            bitIndex++;
         }
     }
+
+    *outCharHeight = glyphHeight;
+    *outCharWidth = glyph->xAdvance;
 }
 
-static void DrawString(u32 *buf, int x, int y, const char *s, u32 stringColour)
+static void DrawString(u32 *buf, int x, int y, const char *s, u32 stringColour, const GFXfont *pGfxFont)
 {
     int charX = x;
 
     for (; *s; ++s)
     {
-        DrawChar(buf, charX, y, *s, stringColour);
-        charX += 8;
+        uint8_t charWidth, charHeight;
+
+        DrawChar(buf, charX, y, *s, stringColour, pGfxFont, &charWidth, &charHeight);
+        charX += charWidth;
     }
 }
 
@@ -247,16 +257,18 @@ static void DrawRowClues(u32 *buf, const PuzzleLayout *pPuzzleLayout, const Puzz
     {
         const ClueLine *pClueLine = &pPuzzleState->rowClues[row];
 
-        int clueStringX1 = pPuzzleLayout->x - 6;
-        int clueStringY0 = pPuzzleLayout->y + row * cellSize + (cellSize - 16) / 2; // Centre clue string to row
+        int clueStringX1 = pPuzzleLayout->x - CLUE_GRID_GAP_PIXELS;
+        int clueStringY0 = pPuzzleLayout->y + row * cellSize +
+                           (cellSize - CLUE_FONT_DIGIT_HEIGHT_PIXELS) / 2 +
+                           CLUE_FONT_DIGIT_BASELINE_PIXELS; // Centre clue string to row
 
         for (int block = pClueLine->blockCount - 1; block >= 0; --block)
         {
             int clueStringLength = snprintf(stringBuf, sizeof(stringBuf), "%d", pClueLine->blocks[block]);
 
-            clueStringX1 -= 8 * clueStringLength + 4;
-
-            DrawString(buf, clueStringX1, clueStringY0, stringBuf, COLOUR_TEXT);
+            clueStringX1 -= CLUE_FONT_DIGIT_ADVANCE_PIXELS * clueStringLength;
+            DrawString(buf, clueStringX1, clueStringY0, stringBuf, COLOUR_TEXT, &FreeSans8pt7b_Stats);
+            clueStringX1 -= CLUE_BLOCK_GAP_PIXELS;
         }
     }
 }
@@ -271,15 +283,17 @@ static void DrawColClues(u32 *buf, const PuzzleLayout *pPuzzleLayout, const Puzz
         const ClueLine *pClueLine = &pPuzzleState->colClues[col];
 
         int clueStringXCentre = pPuzzleLayout->x + col * cellSize + cellSize / 2; // Centre clue string to column
-        int clueStringY0      = pPuzzleLayout->y - 6;
+        int clueStringY0      = pPuzzleLayout->y - CLUE_GRID_GAP_PIXELS -
+                                CLUE_FONT_DIGIT_HEIGHT_PIXELS +
+                                CLUE_FONT_DIGIT_BASELINE_PIXELS;
 
         for (int block = pClueLine->blockCount - 1; block >= 0; --block)
         {
             int clueStringLength = snprintf(stringBuf, sizeof(stringBuf), "%d", pClueLine->blocks[block]);
 
-            clueStringY0 -= 18;
-
-            DrawString(buf, clueStringXCentre - 4 * clueStringLength, clueStringY0, stringBuf, COLOUR_TEXT);
+            DrawString(buf, clueStringXCentre - (CLUE_FONT_DIGIT_ADVANCE_PIXELS * clueStringLength) / 2,
+                       clueStringY0, stringBuf, COLOUR_TEXT, &FreeSans8pt7b_Stats);
+            clueStringY0 -= CLUE_LINE_HEIGHT_PIXELS;
         }
     }
 }
@@ -305,6 +319,25 @@ void GraphicsRender(const PuzzleState *pPuzzleState)
         PuzzleLayout puzzleLayout = SetupPuzzleLayout(pPuzzleState);
 
         DrawPuzzle(buf, &puzzleLayout, pPuzzleState);
+
+        // Draw info text for puzzle
+        char infoString[256];
+        snprintf(infoString, sizeof(infoString), "Size: %dx%d, Difficulty: 0x%02X, Seed: %u",
+                 pPuzzleState->width, pPuzzleState->height, pPuzzleState->difficulty, (unsigned int)pPuzzleState->seed);
+        DrawString(buf, 10, 10, infoString, COLOUR_TEXT, &FreeSans8pt7b_Stats);
+
+        if (pPuzzleState->solverFailed)
+        {
+            int skullX = puzzleLayout.x + puzzleLayout.gridWidth * puzzleLayout.cellSize + 50;
+            int skullY = puzzleLayout.y + (puzzleLayout.gridHeight * puzzleLayout.cellSize) / 2;
+
+            // 'A' is the char for the skull
+            DrawString(buf, skullX, skullY, "A", COLOUR_TEXT, &Fantasy_Clipart50pt7b_A);
+
+            int failTextX = skullX + Fantasy_Clipart50pt7b_AGlyphs[0].width + 10;
+
+            DrawString(buf, failTextX, skullY, "FAIL", COLOUR_TEXT, &PentaGrams_Malefissent50pt7b_FAIL);
+        }
     }
 
     Xil_DCacheFlush();
